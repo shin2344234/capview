@@ -32,6 +32,7 @@ Pick a frame generation mode in settings to make 30 fps games look smoother:
 
 - CapView's own works on any GPU.
 - NVIDIA Smooth Motion needs an RTX 40 or 50 card. On an RTX 20 or 30 card, copy [RTX Encore](https://github.com/SilyNoMeta/rtx-encore)'s `rtx-encore.dll` next to `CapView.exe` as `dxgi.dll`.
+- AMD Fluid Motion Frames needs a Radeon RX 6000 or newer, or Radeon 700M or 800M graphics, with the monitor plugged into it. It only adds frames in fullscreen.
 - Lossless Scaling needs the Steam app. Press L to start it.
 
 ## Notifications
