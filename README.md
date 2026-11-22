@@ -4,7 +4,7 @@ CapView shows a capture card's picture and plays its sound on Windows with as li
 
 ## Use
 
-Put `CapView.exe` in any folder and run it. It finds the capture card, the best video mode and the card's audio by itself. Settings save to `capview.ini` next to the exe.
+Download `CapView.exe` from the [latest release](https://github.com/shin2344234/capview/releases/latest), put it in any folder and run it. It finds the capture card, the best video mode and the card's audio by itself. Settings save to `capview.ini` next to the exe.
 
 | Key | Action |
 | --- | --- |
@@ -58,3 +58,7 @@ If the problem comes and goes, tick "Debug mode" in settings first, make it happ
 ## Build
 
 Run `build.bat` with Visual Studio 2022 or its Build Tools (C++ workload). The exe lands in `bin\CapView.exe`.
+
+Intel's license doesn't allow this repo to carry the XeSS SDK headers. Before building, copy `inc/xess_fg/xefg_swapchain.h`, `inc/xess_fg/xefg_swapchain_d3d12.h`, `inc/xell/xell.h` and `inc/xell/xell_d3d12.h` from the [XeSS SDK](https://github.com/intel/xess) into `src\xess`.
+
+The `tools` folder has the PowerShell and C# scripts used to measure CapView's frame pacing and latency with [PresentMon](https://github.com/GameTechDev/PresentMon).
