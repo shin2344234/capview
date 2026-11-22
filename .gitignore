@@ -1,0 +1,6 @@
+bin/
+obj/
+src/xess/
+relay/
+NOTES.md
+*.log
