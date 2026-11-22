@@ -4,7 +4,9 @@ CapView shows a capture card's picture and plays its sound on Windows with as li
 
 ## Use
 
-Download `CapView.exe` from the [latest release](https://github.com/shin2344234/capview/releases/latest), put it in any folder and run it. It finds the capture card, the best video mode and the card's audio by itself. Settings save to `capview.ini` next to the exe.
+Download `CapView.exe` from the [latest release](https://github.com/shin2344234/capview/releases/latest), put it in any folder and run it. It finds the capture card, the best video mode and the card's audio by itself. Settings save to `capview.ini` next to the exe, and the log goes to `capview.log`.
+
+The exe isn't signed, so on its first run Windows SmartScreen may say "Windows protected your PC". Click More info, then Run anyway.
 
 | Key | Action |
 | --- | --- |
@@ -14,7 +16,7 @@ Download `CapView.exe` from the [latest release](https://github.com/shin2344234/
 | M | Mute |
 | Up, Down | Volume |
 | V | Vsync on or off |
-| G | Frame generation on or off |
+| G | CapView's own frame generation on or off |
 | F | Fps overlay |
 | D, A | Next video device, next audio input |
 | R | Rescan devices |
@@ -55,6 +57,26 @@ Then start CapView, press S and pick NVIDIA Smooth Motion as the frame generatio
 
 To remove RTX Encore, delete `dxgi.dll`, `rtx-encore.jsonc` and the `rtx-encore-logs` folder from CapView's folder.
 
+## Command line
+
+Options on the command line override `capview.ini` for that run. CapView only saves one to `capview.ini` if you change that setting while it runs.
+
+| Option | Effect |
+| --- | --- |
+| `--video <name>` | Opens the video device whose name contains this text |
+| `--audio <name>` | Opens the audio input whose name contains this text, or none with `--audio none` |
+| `--output <name>` | Plays the sound on the output whose name contains this text |
+| `--mode 1920x1080@60` | Asks the card for this video mode |
+| `--framegen <mode>` | Frame generation: `off`, `capview`, `smoothmotion`, `afmf` or `xess` |
+| `--multiplier <2-4>` | How many frames CapView's own frame generation shows per captured frame |
+| `--hdr off` | Shows an HDR source in SDR instead of HDR10 |
+| `--fullscreen` | Starts in fullscreen |
+| `--exclusive` | Uses exclusive fullscreen, which takes the display while CapView has focus |
+| `--vsync` | Starts with vsync on |
+| `--volume <0-200>` | Volume in percent |
+| `--debug` | Turns on debug mode |
+| `--list` | Prints the video devices with their modes, the audio inputs and the audio outputs, then quits |
+
 ## Notifications
 
 A Windows notification can drop the picture to about 30 fps while it's on screen. To stop that, go to Settings > System > Notifications and tick "When using an app in full-screen mode" under "Turn on do not disturb automatically".
@@ -79,7 +101,9 @@ Run `build.bat` with Visual Studio 2022 or its Build Tools (C++ workload). The e
 
 Intel's license doesn't allow this repo to carry the XeSS SDK headers. Before building, copy `inc/xess_fg/xefg_swapchain.h`, `inc/xess_fg/xefg_swapchain_d3d12.h`, `inc/xell/xell.h` and `inc/xell/xell_d3d12.h` from the [XeSS SDK](https://github.com/intel/xess) into `src\xess`.
 
-The `tools` folder has the PowerShell and C# scripts used to measure CapView's frame pacing and latency with [PresentMon](https://github.com/GameTechDev/PresentMon).
+To build while CapView is running, run `tools\build-new.ps1`. It writes `obj\CapView_new.exe` and leaves `bin\CapView.exe` alone.
+
+The `tools` folder also has the PowerShell and C# scripts used to measure CapView's frame pacing and latency with [PresentMon](https://github.com/GameTechDev/PresentMon).
 
 ## License
 
