@@ -1,0 +1,3 @@
+// CapView.exe resources. Resource 101 is capview-camera.dll, the CapView Camera filter. build.bat
+// builds it into obj first, and CapView writes it out to %LOCALAPPDATA%\CapView when the camera is on.
+101 RCDATA "obj/capview-camera.dll"

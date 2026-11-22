@@ -57,6 +57,22 @@ Then start CapView, press S and pick NVIDIA Smooth Motion as the frame generatio
 
 To remove RTX Encore, delete `dxgi.dll`, `rtx-encore.jsonc` and the `rtx-encore-logs` folder from CapView's folder.
 
+## OBS, Discord and browsers
+
+CapView holds the capture card open, so OBS can't open the card at the same time. Instead, tick "CapView Camera for OBS, Discord and browsers" in settings. CapView then adds a camera called CapView Camera that carries its picture. It installs for your Windows account only and doesn't ask for administrator rights.
+
+In OBS, add a Video Capture Device source and pick CapView Camera as the device. The camera has no sound, so also add an Audio Input Capture source with the card's audio device, such as Digital Input (Cam Link 4K). Discord, Zoom and browsers list CapView Camera with your other cameras.
+
+The camera always runs at 1920x1080 and 60 fps in SDR. CapView scales a 4K or 120 fps signal down to that, converts HDR to SDR, and adds black bars to a picture of another shape. The camera gets the captured picture without frame generation or the fps overlay. It shows black while CapView has no signal. When CapView closes, an app that has the camera open keeps a dimmed copy of the last picture.
+
+OBS run as administrator doesn't list CapView Camera, and neither do other apps run as administrator, 32-bit apps or the Windows Camera app.
+
+Untick the setting before you delete CapView, so the camera goes away with it. If CapView is already gone, this removes the camera:
+
+```powershell
+Remove-Item -Recurse "HKCU:\Software\Classes\CLSID\{7BC6709A-957E-427E-A58A-24FAE7A4940C}", "HKCU:\Software\Classes\CLSID\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\Instance\{7BC6709A-957E-427E-A58A-24FAE7A4940C}", "$env:LOCALAPPDATA\CapView"
+```
+
 ## Command line
 
 Options on the command line override `capview.ini` for that run. CapView only saves one to `capview.ini` if you change that setting while it runs.
@@ -83,7 +99,7 @@ A Windows notification can drop the picture to about 30 fps while it's on screen
 
 ## Problems
 
-"in use by another app" means OBS, Elgato Studio, Discord or a browser has the card open. Close it.
+"in use by another app" means OBS, Elgato Studio, Discord or a browser has the card open. Close it, or point that app at CapView Camera instead, as described under OBS, Discord and browsers.
 
 "no picture" means the card gets no signal. Check the console's HDCP setting and the HDMI cable.
 
@@ -97,7 +113,7 @@ If the problem comes and goes, tick "Debug mode" in settings first, make it happ
 
 ## Build
 
-Run `build.bat` with Visual Studio 2022 or its Build Tools (C++ workload). The exe lands in `bin\CapView.exe`.
+Run `build.bat` with Visual Studio 2022 or its Build Tools (C++ workload). The exe lands in `bin\CapView.exe`. The script first builds the CapView Camera filter from `src\camera` into `obj\capview-camera.dll`, and the exe carries that DLL inside it.
 
 Intel's license doesn't allow this repo to carry the XeSS SDK headers. Before building, copy `inc/xess_fg/xefg_swapchain.h`, `inc/xess_fg/xefg_swapchain_d3d12.h`, `inc/xell/xell.h` and `inc/xell/xell_d3d12.h` from the [XeSS SDK](https://github.com/intel/xess) into `src\xess`.
 
@@ -108,3 +124,5 @@ The `tools` folder also has the PowerShell and C# scripts used to measure CapVie
 ## License
 
 CapView is under the [MIT License](LICENSE). The XeSS SDK headers, the XeSS DLLs and RTX Encore keep their own licenses.
+
+CapView Camera is built on [softcam](https://github.com/tshino/softcam) by tshino and on Microsoft's DirectShow base classes from [Windows-classic-samples](https://github.com/microsoft/Windows-classic-samples). Both are under the MIT License, in [src/camera/LICENSE](src/camera/LICENSE) and [src/camera/baseclasses/LICENSE](src/camera/baseclasses/LICENSE).

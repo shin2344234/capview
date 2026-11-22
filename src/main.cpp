@@ -45,11 +45,15 @@
 #pragma comment(lib, "dwmapi.lib")
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+#include "softcamcore/FrameBuffer.h"  // CAMERA_WIDTH, CAMERA_HEIGHT
+#include "softcamcore/SenderAPI.h"
 #pragma comment(lib, "shcore.lib")
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <share.h>
@@ -148,6 +152,7 @@ struct Settings {
     bool showFps = false;
     bool hdr = true;  // HDR10 output for HDR sources when Windows HDR is on
     bool debug = false;  // detailed log for bug reports
+    bool camera = false;  // CapView Camera, the DirectShow camera that OBS and other apps can open
     bool list = false;
     int nvSmooth = -1;      // --nv-smooth-motion 0|1, used by the elevated helper run
 };
@@ -284,6 +289,7 @@ static void LoadIni() {
     s.showFps = IniGet(L"showFps", L"0") == L"1";
     s.hdr = Lower(IniGet(L"hdr", L"auto")) != L"off";
     s.debug = IniGet(L"debug", L"0") == L"1";
+    s.camera = IniGet(L"camera", L"0") == L"1";
 }
 
 static std::vector<std::pair<std::wstring, std::wstring>> IniValues(const Settings& s) {
@@ -304,6 +310,7 @@ static std::vector<std::pair<std::wstring, std::wstring>> IniValues(const Settin
         {L"showFps", s.showFps ? L"1" : L"0"},
         {L"hdr", s.hdr ? L"auto" : L"off"},
         {L"debug", s.debug ? L"1" : L"0"},
+        {L"camera", s.camera ? L"1" : L"0"},
     };
 }
 
@@ -352,7 +359,7 @@ static int CaptureNameScore(const std::wstring& name) {
         L"droidcam", L"ir camera", L"front", L"rear", L"broadcast", L"xsplit", L"streamlabs",
         L"camo", L"iriun", L"c920", L"c922", L"c930", L"brio", L"kiyo", L"lifecam", L"microphone",
         L"headset", L"headphone", L"steam streaming", L"bigscreen", L"voicemeeter", L"vb-audio",
-        L"cable output", L"mixed reality", L"stereo mix", L"what u hear", L"array"};
+        L"cable output", L"mixed reality", L"stereo mix", L"what u hear", L"array", L"capview"};
     int s = 0;
     for (auto k : strong)
         if (n.find(k) != std::wstring::npos) { s = 50; break; }
@@ -1349,6 +1356,143 @@ private:
     bool reset_ = true;
 };
 
+// ------------------------------------------------------------------------------------------------
+// CapView Camera sender. capview-camera.dll is a DirectShow camera that OBS, Discord, Zoom and
+// browsers open, and it reads CapView's picture from shared memory (softcam's FrameBuffer). The
+// render thread hands over packed 1920x1080 BGR24 frames in mapped staging memory, and this worker
+// copies them into the shared memory. The app reading the camera holds the shared memory's named
+// mutex while it copies a frame out, so the render thread never touches that mutex itself.
+// ------------------------------------------------------------------------------------------------
+class CameraSender {
+public:
+    ~CameraSender() { Shutdown(); }
+
+    // On: the worker makes the shared memory, and retries every half second while an app still has
+    // the memory of an earlier CapView open. Off: it removes it, and the camera goes black.
+    void Enable(bool on) {
+        std::lock_guard<std::mutex> l(mx_);
+        want_ = on;
+        kick_ = true;
+        if (on && !th_.joinable()) {
+            quit_ = false;
+            th_ = std::thread([this] { Run(); });
+        }
+        cv_.notify_all();
+    }
+    void Shutdown() {
+        {
+            std::lock_guard<std::mutex> l(mx_);
+            quit_ = true;
+            cv_.notify_all();
+        }
+        if (th_.joinable()) th_.join();
+    }
+    // An app has the camera open. The worker keeps this, so reading it never waits.
+    bool Connected() const { return connected_; }
+    // Hands over a frame of CAMERA_WIDTH x CAMERA_HEIGHT BGR24, top row first. False while the last
+    // frame is still being copied, or while no app has the camera open.
+    bool Submit(const void* bits) {
+        std::lock_guard<std::mutex> l(mx_);
+        if (job_ || !connected_ || quit_) return false;
+        job_ = bits;
+        cv_.notify_all();
+        return true;
+    }
+    // The last frame handed over is copied, so its memory can go.
+    bool JobDone() {
+        std::lock_guard<std::mutex> l(mx_);
+        return !job_;
+    }
+
+private:
+    void Run() {
+        softcam::sender::CameraHandle cam = nullptr;
+        ULONGLONG lastTry = 0, lastPoll = 0;
+        bool failLogged = false;
+        std::unique_lock<std::mutex> l(mx_);
+        while (!quit_) {
+            if (kick_) {
+                kick_ = false;
+                lastTry = 0;
+            }
+            if (want_ && !cam && GetTickCount64() - lastTry >= 500) {
+                lastTry = GetTickCount64();
+                l.unlock();
+                cam = softcam::sender::CreateCamera(softcam::CAMERA_WIDTH, softcam::CAMERA_HEIGHT, 0.0f);
+                l.lock();
+                if (cam) {
+                    Log(L"CapView Camera: on, waiting for an app to open it");
+                    failLogged = false;
+                    lastPoll = 0;
+                } else if (!failLogged) {
+                    Log(L"CapView Camera: shared memory still in use by another CapView or an app that had the "
+                        L"camera open, retrying");
+                    failLogged = true;
+                }
+            }
+            if (cam && !want_) {
+                connected_ = false;
+                l.unlock();
+                softcam::sender::DeleteCamera(cam);
+                l.lock();
+                cam = nullptr;
+                Log(L"CapView Camera: off");
+            }
+            if (job_) {
+                const void* bits = job_;
+                l.unlock();
+                if (cam) softcam::sender::SendFrame(cam, bits);
+                l.lock();
+                job_ = nullptr;
+            }
+            if (cam && GetTickCount64() - lastPoll >= 100) {
+                lastPoll = GetTickCount64();
+                l.unlock();
+                bool c = softcam::sender::IsConnected(cam);
+                l.lock();
+                if (c != connected_) Log(c ? L"CapView Camera: an app opened it" : L"CapView Camera: no app has it open");
+                connected_ = c;
+            }
+            cv_.wait_for(l, std::chrono::milliseconds(100), [this] { return quit_ || job_ || kick_; });
+        }
+        connected_ = false;
+        job_ = nullptr;
+        l.unlock();
+        if (cam) softcam::sender::DeleteCamera(cam);
+    }
+
+    std::mutex mx_;
+    std::condition_variable cv_;
+    std::thread th_;
+    const void* job_ = nullptr;
+    bool want_ = false, quit_ = false, kick_ = false;
+    std::atomic<bool> connected_{false};
+};
+static CameraSender g_camera;
+
+// Packs the CapView Camera picture, a CAMERA_WIDTH x CAMERA_HEIGHT BGRA texture, into BGR24 rows,
+// top row first, which is softcam's shared memory layout. Each thread writes four pixels as three
+// words. The sizes are softcam::CAMERA_WIDTH and CAMERA_HEIGHT.
+static const char kPackHlsl[] = R"HLSL(
+Texture2D<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+uint Px(float4 c) {
+    uint3 v = (uint3)round(saturate(c.bgr) * 255.0);
+    return v.x | (v.y << 8) | (v.z << 16);
+}
+[numthreads(16, 16, 1)]
+void CsPack(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= 1920 / 4 || id.y >= 1080) return;
+    int x = id.x * 4;
+    uint p0 = Px(src.Load(int3(x, id.y, 0)));
+    uint p1 = Px(src.Load(int3(x + 1, id.y, 0)));
+    uint p2 = Px(src.Load(int3(x + 2, id.y, 0)));
+    uint p3 = Px(src.Load(int3(x + 3, id.y, 0)));
+    // B0 G0 R0 B1 | G1 R1 B2 G2 | R2 B3 G3 R3
+    dst.Store3((id.y * 1920 + x) * 3, uint3(p0 | (p1 << 24), (p1 >> 8) | (p2 << 16), (p2 >> 16) | (p3 << 8)));
+}
+)HLSL";
+
 class Renderer {
 public:
     bool Init(HWND hwnd) {
@@ -1706,6 +1850,19 @@ public:
             SlowStep s(L"EnsureProcessor");
             if (!EnsureProcessor(td.Format, f)) return;
         }
+        // CapView Camera gets the captured frame once this one is on screen, on every way out of here,
+        // the frame generation ones too.
+        struct CamSend {
+            Renderer* r;
+            ID3D11Texture2D* tex;
+            UINT sub;
+            DXGI_FORMAT fmt;
+            const FrameFormat& f;
+            ~CamSend() {
+                SlowStep s(L"CameraFrame");
+                r->CameraFrame(tex, sub, fmt, &f);
+            }
+        } camSend{this, tex.Get(), sub, td.Format, f};
 
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
         ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
@@ -1771,6 +1928,14 @@ public:
     }
 
     bool GpuPath() const { return gpuPath_; }
+
+    // From the window timer: moves CapView Camera frames along while no frames arrive, and sends
+    // black once the picture has stopped.
+    void CameraTick() {
+        std::lock_guard<std::mutex> l(m_);
+        if (!ready_ || g_videoActive) return;
+        CameraFrame(nullptr, 0, DXGI_FORMAT_UNKNOWN, nullptr);
+    }
 
 private:
     // ---- CapView frame generation -------------------------------------------------------------
@@ -2649,6 +2814,48 @@ private:
         Log(L"%s 0x%08X", what, hr);
     }
 
+    // Frame format, auto processing, background and color spaces for a video processor that takes f
+    // in fmt. Returns what kind of input it is, for the log.
+    const wchar_t* SetupProcessor(ID3D11VideoProcessor* vp, DXGI_FORMAT fmt, const FrameFormat& f, bool hdrOut) {
+        D3D11_VIDEO_FRAME_FORMAT ff = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        if (f.interlace == MFVideoInterlace_FieldInterleavedUpperFirst) ff = D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST;
+        if (f.interlace == MFVideoInterlace_FieldInterleavedLowerFirst) ff = D3D11_VIDEO_FRAME_FORMAT_INTERLACED_BOTTOM_FIELD_FIRST;
+        vctx_->VideoProcessorSetStreamFrameFormat(vp, 0, ff);
+        vctx_->VideoProcessorSetStreamAutoProcessingMode(vp, 0, FALSE);
+        D3D11_VIDEO_COLOR bg = {};
+        bg.RGBA.A = 1.0f;
+        vctx_->VideoProcessorSetOutputBackgroundColor(vp, FALSE, &bg);
+
+        bool rgb = fmt == DXGI_FORMAT_B8G8R8X8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM;
+        bool hdr = f.transfer == MFVideoTransFunc_2084;
+        bool hlg = f.transfer == MFVideoTransFunc_HLG;
+        bool bt2020 = f.matrix == MFVideoTransferMatrix_BT2020_10 || f.matrix == MFVideoTransferMatrix_BT2020_12 ||
+                      f.primaries == MFVideoPrimaries_BT2020;
+        bool bt601 = f.matrix == MFVideoTransferMatrix_BT601 || (f.matrix == 0 && f.h < 720);
+        bool fullRange = f.range == MFNominalRange_0_255;
+        if (vctx1_) {
+            DXGI_COLOR_SPACE_TYPE in;
+            if (rgb) in = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            else if (hdr) in = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+            else if (hlg) in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 : DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
+            else if (bt2020) in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
+            else if (bt601) in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
+            else in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+            vctx1_->VideoProcessorSetStreamColorSpace1(vp, 0, in);
+            vctx1_->VideoProcessorSetOutputColorSpace1(
+                vp, hdrOut ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        } else {
+            D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {};
+            in.RGB_Range = 0;
+            in.YCbCr_Matrix = bt601 ? 0 : 1;
+            in.Nominal_Range = fullRange ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+            vctx_->VideoProcessorSetStreamColorSpace(vp, 0, &in);
+            D3D11_VIDEO_PROCESSOR_COLOR_SPACE out = {};
+            vctx_->VideoProcessorSetOutputColorSpace(vp, &out);
+        }
+        return rgb ? L"RGB" : (hdr ? L"HDR10" : (hlg ? L"HLG" : L"YUV"));
+    }
+
     bool EnsureProcessor(DXGI_FORMAT fmt, const FrameFormat& f) {
         if (vp_ && fmt == vpFmt_ && f.w == vpF_.w && f.h == vpF_.h && f.fpsN == vpF_.fpsN && f.fpsD == vpF_.fpsD &&
             f.matrix == vpF_.matrix && f.range == vpF_.range && f.transfer == vpF_.transfer && f.interlace == vpF_.interlace)
@@ -2688,48 +2895,242 @@ private:
             vpe_.Reset();
             return false;
         }
-        D3D11_VIDEO_FRAME_FORMAT ff = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        if (f.interlace == MFVideoInterlace_FieldInterleavedUpperFirst) ff = D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST;
-        if (f.interlace == MFVideoInterlace_FieldInterleavedLowerFirst) ff = D3D11_VIDEO_FRAME_FORMAT_INTERLACED_BOTTOM_FIELD_FIRST;
-        vctx_->VideoProcessorSetStreamFrameFormat(vp_.Get(), 0, ff);
-        vctx_->VideoProcessorSetStreamAutoProcessingMode(vp_.Get(), 0, FALSE);
-        D3D11_VIDEO_COLOR bg = {};
-        bg.RGBA.A = 1.0f;
-        vctx_->VideoProcessorSetOutputBackgroundColor(vp_.Get(), FALSE, &bg);
-
-        bool rgb = fmt == DXGI_FORMAT_B8G8R8X8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM;
-        bool hdr = f.transfer == MFVideoTransFunc_2084;
-        bool hlg = f.transfer == MFVideoTransFunc_HLG;
-        bool bt2020 = f.matrix == MFVideoTransferMatrix_BT2020_10 || f.matrix == MFVideoTransferMatrix_BT2020_12 ||
-                      f.primaries == MFVideoPrimaries_BT2020;
-        bool bt601 = f.matrix == MFVideoTransferMatrix_BT601 || (f.matrix == 0 && f.h < 720);
-        bool fullRange = f.range == MFNominalRange_0_255;
-        if (vctx1_) {
-            DXGI_COLOR_SPACE_TYPE in;
-            if (rgb) in = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-            else if (hdr) in = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
-            else if (hlg) in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 : DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
-            else if (bt2020) in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
-            else if (bt601) in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
-            else in = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
-            vctx1_->VideoProcessorSetStreamColorSpace1(vp_.Get(), 0, in);
-            vctx1_->VideoProcessorSetOutputColorSpace1(
-                vp_.Get(), hdrOut_ ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-        } else {
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE in = {};
-            in.RGB_Range = 0;
-            in.YCbCr_Matrix = bt601 ? 0 : 1;
-            in.Nominal_Range = fullRange ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-            vctx_->VideoProcessorSetStreamColorSpace(vp_.Get(), 0, &in);
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE out = {};
-            vctx_->VideoProcessorSetOutputColorSpace(vp_.Get(), &out);
-        }
+        const wchar_t* kind = SetupProcessor(vp_.Get(), fmt, f, hdrOut_);
         vpFmt_ = fmt;
         vpF_ = f;
         lastErr_ = S_OK;
         Log(L"Video processor ready: %s, matrix %u range %u transfer %u, %s in, %s out", ModeText(f).c_str(), f.matrix,
-            f.range, f.transfer, rgb ? L"RGB" : (hdr ? L"HDR10" : (hlg ? L"HLG" : L"YUV")), hdrOut_ ? L"HDR10" : L"SDR");
+            f.range, f.transfer, kind, hdrOut_ ? L"HDR10" : L"SDR");
         return true;
+    }
+
+    // ---- CapView Camera ------------------------------------------------------------------------
+    // The camera gets the clean captured picture, scaled and letterboxed to 1920x1080 in SDR, with no
+    // frame generation and no overlay. Its own video processor writes camTex_, a compute shader packs
+    // that into BGR24 in camBuf_, and a copy goes to one of the staging buffers. A later call maps the
+    // newest finished copy and hands it to g_camera, and the one after that unmaps it again.
+    static const UINT kCamW = softcam::CAMERA_WIDTH, kCamH = softcam::CAMERA_HEIGHT;
+    static const UINT kCamBytes = kCamW * kCamH * 3;
+
+    bool CamResources() {
+        if (camBuf_) return true;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = kCamW;
+        td.Height = kCamH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        HRESULT hr = dev_->CreateTexture2D(&td, nullptr, &camTex_);
+        if (SUCCEEDED(hr)) hr = dev_->CreateShaderResourceView(camTex_.Get(), nullptr, &camSrv_);
+        if (SUCCEEDED(hr)) hr = dev_->CreateRenderTargetView(camTex_.Get(), nullptr, &camRtv_);
+        ComPtr<ID3D11Buffer> buf;
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = kCamBytes;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        if (SUCCEEDED(hr)) hr = dev_->CreateBuffer(&bd, nullptr, &buf);
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = kCamBytes / 4;
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (SUCCEEDED(hr)) hr = dev_->CreateUnorderedAccessView(buf.Get(), &ud, &camUav_);
+        D3D11_BUFFER_DESC sd = {};
+        sd.ByteWidth = kCamBytes;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        for (int i = 0; i < kCamRing && SUCCEEDED(hr); i++) hr = dev_->CreateBuffer(&sd, nullptr, &camStage_[i]);
+        if (FAILED(hr)) {
+            Log(L"CapView Camera: GPU buffers failed 0x%08X, the camera stays black", hr);
+            camBroken_ = true;
+            return false;
+        }
+        camBuf_ = buf;
+        LARGE_INTEGER fq;
+        QueryPerformanceFrequency(&fq);
+        camQpf_ = (double)fq.QuadPart;
+        return true;
+    }
+
+    // The pack shader compiles on a background thread, like the frame generation shaders, so the
+    // first app that opens the camera doesn't stall a frame.
+    bool CamShaderReady() {
+        if (camInit_) return !!csPack_;
+        if (!camBlob_) {
+            camBlob_ = std::make_shared<CamBlob>();
+            std::thread([j = camBlob_] {
+                j->ok = Compile(kPackHlsl, sizeof(kPackHlsl) - 1, "CsPack", "cs_5_0", j->b);
+                j->done = true;
+            }).detach();
+        }
+        if (!camBlob_->done) return false;
+        camInit_ = true;
+        if (!camBlob_->ok || FAILED(dev_->CreateComputeShader(camBlob_->b->GetBufferPointer(),
+                                                               camBlob_->b->GetBufferSize(), nullptr, &csPack_))) {
+            Log(L"CapView Camera: pack shader failed, the camera stays black");
+            camBroken_ = true;
+            return false;
+        }
+        return true;
+    }
+
+    bool CamProcessor(DXGI_FORMAT fmt, const FrameFormat& f) {
+        if (camVp_ && fmt == camFmt_ && f.w == camF_.w && f.h == camF_.h && f.fpsN == camF_.fpsN &&
+            f.fpsD == camF_.fpsD && f.matrix == camF_.matrix && f.range == camF_.range &&
+            f.transfer == camF_.transfer && f.interlace == camF_.interlace && f.primaries == camF_.primaries)
+            return true;
+        camOv_.Reset();
+        camVp_.Reset();
+        camVpe_.Reset();
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {};
+        cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        cd.InputFrameRate = {f.fpsN, f.fpsD};
+        cd.InputWidth = f.w;
+        cd.InputHeight = f.h;
+        cd.OutputFrameRate = {f.fpsN, f.fpsD};
+        cd.OutputWidth = kCamW;
+        cd.OutputHeight = kCamH;
+        cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+        HRESULT hr = vdev_->CreateVideoProcessorEnumerator(&cd, &camVpe_);
+        UINT fl = 0;
+        if (SUCCEEDED(hr) && (FAILED(camVpe_->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &fl)) ||
+                              !(fl & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)))
+            hr = E_FAIL;
+        if (SUCCEEDED(hr)) hr = vdev_->CreateVideoProcessor(camVpe_.Get(), 0, &camVp_);
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
+        ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        if (SUCCEEDED(hr)) hr = vdev_->CreateVideoProcessorOutputView(camTex_.Get(), camVpe_.Get(), &ovd, &camOv_);
+        if (FAILED(hr)) {
+            Log(L"CapView Camera: video processor failed 0x%08X, the camera stays black", hr);
+            camOv_.Reset();
+            camVp_.Reset();
+            camVpe_.Reset();
+            camBroken_ = true;
+            return false;
+        }
+        SetupProcessor(camVp_.Get(), fmt, f, false);
+        camFmt_ = fmt;
+        camF_ = f;
+        return true;
+    }
+
+    // Unmaps the frame g_camera finished with, then maps the newest finished copy and hands it over.
+    // Older copies that are done by then are dropped.
+    void CamCollect() {
+        if (camSent_ >= 0) {
+            if (!g_camera.JobDone()) return;
+            ctx_->Unmap(camStage_[camSent_].Get(), 0);
+            camState_[camSent_] = 0;
+            camSent_ = -1;
+        }
+        for (;;) {
+            int s = -1;
+            for (int i = 0; i < kCamRing; i++)
+                if (camState_[i] == 1 && (s < 0 || camSeq_[i] > camSeq_[s])) s = i;
+            if (s < 0) break;
+            D3D11_MAPPED_SUBRESOURCE m = {};
+            HRESULT hr = ctx_->Map(camStage_[s].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+            if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+                // Copies finish in order, so an older one may be done. Try it next time round.
+                bool older = false;
+                for (int i = 0; i < kCamRing; i++)
+                    if (camState_[i] == 1 && camSeq_[i] < camSeq_[s]) older = true;
+                if (!older) break;
+                camState_[s] = 3;  // set aside while the older ones are tried
+                continue;
+            }
+            if (SUCCEEDED(hr) && g_camera.Submit(m.pData)) {
+                camState_[s] = 2;
+                camSent_ = s;
+            } else {
+                if (SUCCEEDED(hr)) ctx_->Unmap(camStage_[s].Get(), 0);
+                camState_[s] = 0;
+            }
+            for (int i = 0; i < kCamRing; i++)
+                if (camState_[i] == 1 && camSeq_[i] < camSeq_[s]) camState_[i] = 0;
+            break;
+        }
+        for (int i = 0; i < kCamRing; i++)
+            if (camState_[i] == 3) camState_[i] = 1;
+    }
+
+    // Queues the picture for CapView Camera. tex is the captured frame, or null for black.
+    void CameraFrame(ID3D11Texture2D* tex, UINT sub, DXGI_FORMAT fmt, const FrameFormat* f) {
+        if (camBroken_) return;
+        CamCollect();
+        if (!g_camera.Connected()) return;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        // The camera runs at 60 fps, so a 120 fps source sends every other frame.
+        if (tex && camQpf_ > 1 && (double)(now.QuadPart - camLast_) < 0.012 * camQpf_) return;
+        if (!tex && camBlack_) return;
+        int slot = -1;
+        for (int i = 0; i < kCamRing && slot < 0; i++)
+            if (camState_[i] == 0) slot = i;
+        if (slot < 0) return;
+        if (!CamResources() || !CamShaderReady()) return;
+        if (tex) {
+            if (!CamProcessor(fmt, *f)) return;
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
+            ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            ivd.Texture2D.ArraySlice = sub;
+            ComPtr<ID3D11VideoProcessorInputView> iv;
+            HRESULT hr = vdev_->CreateVideoProcessorInputView(tex, camVpe_.Get(), &ivd, &iv);
+            if (FAILED(hr)) {
+                if (!camIvLogged_) Log(L"CapView Camera: input view failed 0x%08X", hr);
+                camIvLogged_ = true;
+                return;
+            }
+            double srcAspect = (double)f->w * f->parN / ((double)f->h * f->parD);
+            double dstAspect = (double)kCamW / kCamH;
+            RECT dst;
+            if (dstAspect > srcAspect) {
+                LONG w = (LONG)std::lround(kCamH * srcAspect);
+                dst = {(LONG)(kCamW - w) / 2, 0, (LONG)(kCamW - w) / 2 + w, (LONG)kCamH};
+            } else {
+                LONG h = (LONG)std::lround(kCamW / srcAspect);
+                dst = {0, (LONG)(kCamH - h) / 2, (LONG)kCamW, (LONG)(kCamH - h) / 2 + h};
+            }
+            RECT src = {0, 0, (LONG)f->w, (LONG)f->h};
+            RECT full = {0, 0, (LONG)kCamW, (LONG)kCamH};
+            vctx_->VideoProcessorSetStreamSourceRect(camVp_.Get(), 0, TRUE, &src);
+            vctx_->VideoProcessorSetStreamDestRect(camVp_.Get(), 0, TRUE, &dst);
+            vctx_->VideoProcessorSetOutputTargetRect(camVp_.Get(), TRUE, &full);
+            D3D11_VIDEO_PROCESSOR_STREAM st = {};
+            st.Enable = TRUE;
+            st.pInputSurface = iv.Get();
+            hr = vctx_->VideoProcessorBlt(camVp_.Get(), camOv_.Get(), camFrame_++, 1, &st);
+            if (FAILED(hr)) {
+                if (!camBltLogged_) Log(L"CapView Camera: VideoProcessorBlt failed 0x%08X", hr);
+                camBltLogged_ = true;
+                return;
+            }
+            camBlack_ = false;
+        } else {
+            const float black[4] = {0, 0, 0, 1};
+            ctx_->ClearRenderTargetView(camRtv_.Get(), black);
+            camBlack_ = true;
+        }
+        ctx_->CSSetShader(csPack_.Get(), nullptr, 0);
+        ctx_->CSSetShaderResources(0, 1, camSrv_.GetAddressOf());
+        ctx_->CSSetUnorderedAccessViews(0, 1, camUav_.GetAddressOf(), nullptr);
+        ctx_->Dispatch((kCamW / 4 + 15) / 16, (kCamH + 15) / 16, 1);
+        ID3D11ShaderResourceView* noSrv = nullptr;
+        ID3D11UnorderedAccessView* noUav = nullptr;
+        ctx_->CSSetShaderResources(0, 1, &noSrv);
+        ctx_->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+        ctx_->CSSetShader(nullptr, nullptr, 0);
+        ctx_->CopyResource(camStage_[slot].Get(), camBuf_.Get());
+        // The frame is already on screen, so this only starts the camera's own GPU work now instead
+        // of at the next present.
+        ctx_->Flush();
+        camState_[slot] = 1;
+        camSeq_[slot] = ++camNext_;
+        camLast_ = now.QuadPart;
     }
 
     // Copies a system memory frame into a GPU texture.
@@ -2994,6 +3395,34 @@ private:
     ComPtr<ID3D11Texture2D> rgb_[kSlots], lum_[kSlots][kLevels], fld_[kLevels], med_;
     ComPtr<ID3D11ShaderResourceView> rgbSrv_[kSlots], lumSrv_[kSlots][kLevels], fldSrv_[kLevels], medSrv_;
     ComPtr<ID3D11UnorderedAccessView> lumUav_[kSlots][kLevels], fldUav_[kLevels], medUav_;
+
+    // CapView Camera
+    static const int kCamRing = 3;
+    struct CamBlob {
+        ComPtr<ID3DBlob> b;
+        std::atomic<bool> done{false};
+        bool ok = false;
+    };
+    std::shared_ptr<CamBlob> camBlob_;
+    bool camInit_ = false, camBroken_ = false, camBlack_ = false, camIvLogged_ = false, camBltLogged_ = false;
+    ComPtr<ID3D11ComputeShader> csPack_;
+    ComPtr<ID3D11VideoProcessorEnumerator> camVpe_;
+    ComPtr<ID3D11VideoProcessor> camVp_;
+    ComPtr<ID3D11VideoProcessorOutputView> camOv_;
+    DXGI_FORMAT camFmt_ = DXGI_FORMAT_UNKNOWN;
+    FrameFormat camF_;
+    ComPtr<ID3D11Texture2D> camTex_;
+    ComPtr<ID3D11ShaderResourceView> camSrv_;
+    ComPtr<ID3D11RenderTargetView> camRtv_;
+    ComPtr<ID3D11UnorderedAccessView> camUav_;
+    ComPtr<ID3D11Buffer> camBuf_, camStage_[kCamRing];
+    int camState_[kCamRing] = {};  // 0 free, 1 copy queued, 2 mapped and with g_camera, 3 set aside in CamCollect
+    UINT64 camSeq_[kCamRing] = {};
+    UINT64 camNext_ = 0;
+    int camSent_ = -1;
+    UINT camFrame_ = 0;
+    LONGLONG camLast_ = 0;
+    double camQpf_ = 0;
 };
 
 static Renderer g_renderer;
@@ -3312,10 +3741,13 @@ static void CloseSession(std::shared_ptr<VideoSession>& S) {
 // CAPVIEW_TEST_SOURCE=dim the box is 1 luma step above a near-black background, like motion in a
 // dark scene, so no sample moves past the 2.5 step margin and only the exact-repeat rule sees it.
 // A 2 step box isn't enough, since the video processor's rounding to 8-bit RGB makes it 3.
+// With CAPVIEW_TEST_SOURCE=color the box is pure red, so a red and blue swap shows on screen and
+// in CapView Camera.
 static void TestSource() {
     wchar_t mode[16] = {};
     GetEnvironmentVariableW(L"CAPVIEW_TEST_SOURCE", mode, 16);
     bool dim = _wcsicmp(mode, L"dim") == 0;
+    bool color = _wcsicmp(mode, L"color") == 0;
     FrameFormat f;
     f.subtype = MFVideoFormat_YUY2;
     f.w = 1920;
@@ -3326,7 +3758,8 @@ static void TestSource() {
     f.range = MFNominalRange_16_235;
     const DWORD size = f.w * f.h * 2;
     std::vector<BYTE> pic(size);
-    Log(L"Test source: 1920x1080 YUY2 60 fps, a new picture every second frame%s", dim ? L", dim" : L"");
+    Log(L"Test source: 1920x1080 YUY2 60 fps, a new picture every second frame%s",
+        dim ? L", dim" : color ? L", red box" : L"");
     SetVideoStatus(L"Test source, 1080p60 with a 30 fps picture");
     g_videoActive = true;
     LARGE_INTEGER fq, t0;
@@ -3339,10 +3772,14 @@ static void TestSource() {
                 BYTE* row = pic.data() + (size_t)y * f.stride;
                 bool boxRow = y >= 420 && y < 660;
                 for (UINT x = 0; x < f.w; x += 2) {
-                    BYTE luma = dim ? 18 : ((x / 60 + y / 60) % 2) ? 70 : 110;
-                    if (boxRow && (int)x >= bx && (int)x < bx + 240) luma = dim ? 19 : 235;
+                    BYTE luma = dim ? 18 : ((x / 60 + y / 60) % 2) ? 70 : 110, u = 128, v = 128;
+                    if (boxRow && (int)x >= bx && (int)x < bx + 240) {
+                        luma = dim ? 19 : color ? 63 : 235;
+                        if (color) u = 102, v = 240;  // BT.709 limited range red
+                    }
                     row[x * 2] = row[x * 2 + 2] = luma;
-                    row[x * 2 + 1] = row[x * 2 + 3] = 128;
+                    row[x * 2 + 1] = u;
+                    row[x * 2 + 3] = v;
                 }
             }
         }
@@ -6189,12 +6626,178 @@ static void SetFgMode(int m, HWND owner) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// CapView Camera install. CapView.exe carries capview-camera.dll as resource 101 and writes it to
+// %LOCALAPPDATA%\CapView under a name with a hash of its bytes, so a newer CapView never has to
+// replace a copy that OBS still has loaded. The camera is registered for the current user, which
+// needs no administrator rights. A second run of CapView with --camera-register does the
+// registration, because softcam's setup points HKEY_CLASSES_ROOT at the user's classes for the
+// whole process while it writes.
+// ------------------------------------------------------------------------------------------------
+static const wchar_t kCamClsid[] = L"{7BC6709A-957E-427E-A58A-24FAE7A4940C}";
+static const wchar_t kCamCategory[] = L"{860BB310-5D01-11d0-BD3B-00A0C911CE86}";  // video capture sources
+static std::wstring g_camRegister;  // --camera-register <dll>, the registration run
+static bool g_cameraOn = false;
+
+static std::wstring CameraDir() {
+    wchar_t* p = nullptr;
+    std::wstring d;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p))) d = std::wstring(p) + L"\\CapView";
+    CoTaskMemFree(p);
+    return d;
+}
+
+// Writes the camera DLL out, unless this CapView's copy is there already. Returns its path, or
+// empty when it couldn't.
+static std::wstring CameraDllWrite() {
+    HMODULE m = GetModuleHandleW(nullptr);
+    HRSRC r = FindResourceW(m, MAKEINTRESOURCEW(101), MAKEINTRESOURCEW(10));  // RT_RCDATA
+    HGLOBAL g = r ? LoadResource(m, r) : nullptr;
+    const BYTE* data = g ? (const BYTE*)LockResource(g) : nullptr;
+    DWORD size = r ? SizeofResource(m, r) : 0;
+    if (!data || !size) {
+        Log(L"CapView Camera: the camera DLL is missing from CapView.exe");
+        return L"";
+    }
+    uint32_t hash = 2166136261u;  // FNV-1a
+    for (DWORD i = 0; i < size; i++) hash = (hash ^ data[i]) * 16777619u;
+    std::wstring dir = CameraDir();
+    if (dir.empty()) return L"";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring path = dir + Fmt(L"\\capview-camera-%08x.dll", hash);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeHigh == 0 && fa.nFileSizeLow == size)
+        return path;
+    std::wstring tmp = path + L".tmp";
+    HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD wrote = 0;
+    bool ok = f != INVALID_HANDLE_VALUE && WriteFile(f, data, size, &wrote, nullptr) && wrote == size;
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    if (!ok) {
+        Log(L"CapView Camera: couldn't write %s (error %u)", path.c_str(), GetLastError());
+        DeleteFileW(tmp.c_str());
+        return L"";
+    }
+    return path;
+}
+
+// Deletes the camera DLLs in CameraDir other than keep. A copy that an app still has loaded stays.
+static void CameraDllCleanup(const std::wstring& keep) {
+    std::wstring dir = CameraDir();
+    if (dir.empty()) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE fh = FindFirstFileW((dir + L"\\capview-camera-*").c_str(), &fd);
+    if (fh == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring p = dir + L"\\" + fd.cFileName;
+        if (_wcsicmp(p.c_str(), keep.c_str()) != 0) DeleteFileW(p.c_str());
+    } while (FindNextFileW(fh, &fd));
+    FindClose(fh);
+}
+
+static std::wstring RegString(const std::wstring& key, const wchar_t* value) {
+    wchar_t buf[1024] = {};
+    DWORD n = sizeof(buf);
+    if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), value, RRF_RT_REG_SZ, nullptr, buf, &n) != ERROR_SUCCESS) return L"";
+    return buf;
+}
+
+static bool CameraRegistered(const std::wstring& dll) {
+    std::wstring server = RegString(std::wstring(L"Software\\Classes\\CLSID\\") + kCamClsid + L"\\InprocServer32", nullptr);
+    std::wstring name = RegString(std::wstring(L"Software\\Classes\\CLSID\\") + kCamCategory + L"\\Instance\\" + kCamClsid,
+                                  L"FriendlyName");
+    return _wcsicmp(server.c_str(), dll.c_str()) == 0 && !name.empty();
+}
+
+// The registration run. Its exit code is DllInstall's HRESULT.
+static int CameraRegisterRun(const std::wstring& dll) {
+    HMODULE m = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!m) return (int)HRESULT_FROM_WIN32(GetLastError());
+    typedef HRESULT(STDAPICALLTYPE * InstallFn)(BOOL, LPCWSTR);
+    auto install = (InstallFn)GetProcAddress(m, "DllInstall");
+    HRESULT hr = install ? install(TRUE, L"user") : HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    FreeLibrary(m);
+    return (int)hr;
+}
+
+// Writes the DLL out and registers it for this user if it isn't yet. Returns what went wrong, or
+// empty.
+static std::wstring CameraInstall() {
+    std::wstring dll = CameraDllWrite();
+    if (dll.empty()) return L"CapView couldn't write the camera DLL to " + CameraDir() + L".";
+    if (!CameraRegistered(dll)) {
+        std::wstring cmd = L"\"" + ExePath() + L"\" --camera-register \"" + dll + L"\"";
+        STARTUPINFOW si = {sizeof(si)};
+        PROCESS_INFORMATION pi = {};
+        DWORD code = (DWORD)E_FAIL;
+        if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 20000);
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        } else {
+            code = (DWORD)HRESULT_FROM_WIN32(GetLastError());
+        }
+        if (code != 0 || !CameraRegistered(dll)) {
+            Log(L"CapView Camera: registering %s failed 0x%08X", dll.c_str(), code);
+            return Fmt(L"Windows didn't take the camera registration (error 0x%08X).", code);
+        }
+        Log(L"CapView Camera: registered %s for this user", dll.c_str());
+    }
+    CameraDllCleanup(dll);
+    return L"";
+}
+
+// Takes the camera out of this user's registry and deletes the DLLs no app has loaded.
+static void CameraRemove() {
+    std::wstring classes = L"Software\\Classes\\CLSID\\";
+    RegDeleteTreeW(HKEY_CURRENT_USER, (classes + kCamCategory + L"\\Instance\\" + kCamClsid).c_str());
+    RegDeleteTreeW(HKEY_CURRENT_USER, (classes + kCamClsid).c_str());
+    CameraDllCleanup(L"");
+    RemoveDirectoryW(CameraDir().c_str());  // only when empty, so a DLL an app still has loaded keeps it
+    Log(L"CapView Camera: removed for this user");
+}
+
+// The settings checkbox. owner gets the message boxes, or none at startup when it's null.
+static void SetCameraOn(bool on, HWND owner) {
+    if (on) {
+        HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+        std::wstring err = CameraInstall();
+        SetCursor(old);
+        if (!err.empty()) {
+            if (owner)
+                MessageBoxW(owner, (L"CapView Camera didn't turn on. " + err).c_str(), L"CapView", MB_ICONERROR);
+            return;
+        }
+        g_camera.Enable(true);
+        g_cameraOn = true;
+        if (owner)
+            MessageBoxW(owner,
+                        L"CapView Camera is on.\n\n"
+                        L"In OBS, add a Video Capture Device source and pick CapView Camera as its device. Discord, "
+                        L"Zoom and browsers list it with the other cameras.\n\n"
+                        L"The camera gets the captured picture at 1920x1080 and 60 fps, without frame generation "
+                        L"or the fps overlay. It has no sound. For sound in OBS, add an Audio Input Capture source "
+                        L"with your capture card's audio device.\n\n"
+                        L"Apps that run as administrator don't see the camera, and neither does the Windows Camera "
+                        L"app. Untick this setting before you delete CapView, so the camera goes away too.",
+                        L"CapView", MB_ICONINFORMATION);
+    } else {
+        g_camera.Enable(false);
+        g_cameraOn = false;
+        CameraRemove();
+    }
+    std::lock_guard<std::mutex> l(g_setMx);
+    g_set.camera = g_cameraOn;
+}
+
+// ------------------------------------------------------------------------------------------------
 // Settings window
 // ------------------------------------------------------------------------------------------------
 enum {
     IDC_VIDEO = 100, IDC_MODE, IDC_AUDIOIN, IDC_AUDIOOUT, IDC_VOLUME, IDC_VOLTEXT, IDC_MUTE, IDC_VSYNC, IDC_FULL,
     IDC_FG, IDC_MULT, IDC_INFO, IDC_CLOSE, IDC_SHOWFPS, IDC_HDR, IDC_PREDICT, IDC_EXCL,
-    IDC_DEBUG, IDC_REPORT, IDC_BUG,
+    IDC_DEBUG, IDC_REPORT, IDC_BUG, IDC_CAMERA,
 };
 static HWND g_settings = nullptr;
 static HFONT g_font = nullptr;
@@ -6366,6 +6969,7 @@ static void PopulateSettings(HWND h) {
     Check(h, IDC_FULL, s.fullscreen);
     Check(h, IDC_EXCL, g_exclusive);
     Check(h, IDC_DEBUG, g_debug);
+    Check(h, IDC_CAMERA, g_cameraOn);
     SyncSettingsUi();
 }
 
@@ -6448,6 +7052,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_fullscreen) g_renderer.SetExclusive(g_exclusive);
                 }
                 if (id == IDC_DEBUG) SetDebug(Checked(h, IDC_DEBUG));
+                if (id == IDC_CAMERA) {
+                    SetCameraOn(Checked(h, IDC_CAMERA), h);
+                    Check(h, IDC_CAMERA, g_cameraOn);
+                }
                 if (id == IDC_REPORT) SaveDebugReport(h);
                 if (id == IDC_BUG) ReportBug(h);
                 std::lock_guard<std::mutex> l(g_setMx);
@@ -6511,7 +7119,7 @@ static void OpenSettings() {
 
     const int M = 12, LW = 130, CW = 330, RH = 32;
     int clientW = M + LW + 8 + CW + M;
-    int y = M, rows = 12;
+    int y = M, rows = 13;
     int infoH = 130;
     int clientH = M + rows * RH + infoH + 12 + 28 + M;
     RECT rc = {0, 0, S(clientW), S(clientH)};
@@ -6576,6 +7184,10 @@ static void OpenSettings() {
     ctl(L"BUTTON", L"Exclusive (takes the display while CapView has focus)", BS_AUTOCHECKBOX | WS_TABSTOP, cx, y + 2,
         CW, 22, IDC_EXCL);
     y += RH;
+    label(L"Streaming");
+    ctl(L"BUTTON", L"CapView Camera for OBS, Discord and browsers", BS_AUTOCHECKBOX | WS_TABSTOP, cx, y + 2, CW, 22,
+        IDC_CAMERA);
+    y += RH;
     label(L"Troubleshooting");
     ctl(L"BUTTON", L"Debug mode (detailed log)", BS_AUTOCHECKBOX | WS_TABSTOP, cx, y + 2, CW, 22, IDC_DEBUG);
     y += RH;
@@ -6619,6 +7231,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateTitle(h);
             PlaceCapView();  // catches a change the window event hooks missed
             if (g_showFps && !g_videoActive && g_renderer.Ready()) g_renderer.PresentBlack();
+            if (!g_videoActive && g_camera.Connected()) g_renderer.CameraTick();
             return 0;
         case WM_SETCURSOR:
             // Fullscreen hides the pointer over the picture, except while settings is open.
@@ -6734,6 +7347,7 @@ static void ParseArgs() {
         else if (a == L"--nv-smooth-motion") g_set.nvSmooth = _wtoi(next().c_str()) ? 1 : 0;
         else if (a == L"--hdr") g_set.hdr = Lower(next()) != L"off";
         else if (a == L"--after") g_afterPid = (DWORD)_wtoi(next().c_str());
+        else if (a == L"--camera-register") g_camRegister = next();
     }
     LocalFree(argv);
 }
@@ -6754,6 +7368,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     }
     g_cliSet = g_set;
     if (g_set.nvSmooth >= 0) return ApplySmoothMotion(g_set.nvSmooth == 1);
+    if (!g_camRegister.empty()) return CameraRegisterRun(g_camRegister);
     if (g_afterPid) {
         if (HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, g_afterPid)) {
             WaitForSingleObject(p, 5000);
@@ -6828,6 +7443,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     if (g_set.fullscreen) ToggleFullscreen(g_hwnd);
     g_renderer.PresentBlack();
     SetTimer(g_hwnd, 1, 500, nullptr);
+    if (g_set.camera) SetCameraOn(true, nullptr);
     Log(L"Settings file %s, frame generation %s %dx", g_iniPath.c_str(), kFgKeys[g_fgMode.load()], g_fgMult.load());
     g_encore = FindRtxEncore();
     if (!g_encore.empty()) {
@@ -6905,6 +7521,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     g_quit = true;
     vt.join();
     at.join();
+    g_camera.Shutdown();
     if (IniGet(L"afmfOwned", L"0") == L"1") AfmfFollow(false);
     SetThreadExecutionState(ES_CONTINUOUS);
     Log(L"Exit");
