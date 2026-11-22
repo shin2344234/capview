@@ -5521,7 +5521,7 @@ static void UpdateFps(HWND h, double dt) {
 // ------------------------------------------------------------------------------------------------
 // Debug mode, crash dumps and debug reports
 // ------------------------------------------------------------------------------------------------
-static const wchar_t* kVersion = L"1.0.0";
+static const wchar_t* kVersion = L"1.1.1";
 static const wchar_t* kBuild = L"" __DATE__ " " __TIME__;
 
 static std::wstring ExeDir() {
@@ -7425,7 +7425,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));  // with hIconSm left null, Windows picks the small size from it
     wc.lpszClassName = L"CapViewWindow";
     RegisterClassExW(&wc);
 
