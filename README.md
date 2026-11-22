@@ -73,6 +73,8 @@ Untick the setting before you delete CapView, so the camera goes away with it. I
 Remove-Item -Recurse "HKCU:\Software\Classes\CLSID\{7BC6709A-957E-427E-A58A-24FAE7A4940C}", "HKCU:\Software\Classes\CLSID\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\Instance\{7BC6709A-957E-427E-A58A-24FAE7A4940C}", "$env:LOCALAPPDATA\CapView"
 ```
 
+Browsers load the camera's DLL when they list cameras and keep it until they close. If the command says access to a `capview-camera` file is denied, the camera is already removed, and the `CapView` folder in `%LOCALAPPDATA%` can go once the browser is closed.
+
 ## Command line
 
 Options on the command line override `capview.ini` for that run. CapView only saves one to `capview.ini` if you change that setting while it runs.
