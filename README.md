@@ -20,6 +20,8 @@ Put `CapView.exe` in any folder and run it. It finds the capture card, the best 
 | R | Rescan devices |
 | F1 | Key list |
 
+In fullscreen, CapView stays in front of windows on your other monitors. A window maximized on the next monitor would otherwise make Windows compose CapView's picture and drop frames. A window you open on CapView's own screen still comes up in front of it.
+
 ## Console settings
 
 On a PS5, turn off "Enable HDCP" in Settings > System > HDMI, or there's no picture.
