@@ -62,3 +62,7 @@ Run `build.bat` with Visual Studio 2022 or its Build Tools (C++ workload). The e
 Intel's license doesn't allow this repo to carry the XeSS SDK headers. Before building, copy `inc/xess_fg/xefg_swapchain.h`, `inc/xess_fg/xefg_swapchain_d3d12.h`, `inc/xell/xell.h` and `inc/xell/xell_d3d12.h` from the [XeSS SDK](https://github.com/intel/xess) into `src\xess`.
 
 The `tools` folder has the PowerShell and C# scripts used to measure CapView's frame pacing and latency with [PresentMon](https://github.com/GameTechDev/PresentMon).
+
+## License
+
+CapView is under the [MIT License](LICENSE). The XeSS SDK headers, the XeSS DLLs and RTX Encore keep their own licenses.
