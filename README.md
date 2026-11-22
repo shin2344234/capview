@@ -15,6 +15,7 @@ Put `CapView.exe` in any folder and run it. It finds the capture card, the best 
 | Up, Down | Volume |
 | V | Vsync on or off |
 | G | Frame generation on or off |
+| L | Lossless Scaling on or off |
 | F | Fps overlay |
 | D, A | Next video device, next audio input |
 | R | Rescan devices |
@@ -33,7 +34,8 @@ Pick a frame generation mode in settings to make 30 fps games look smoother:
 - CapView's own works on any GPU.
 - NVIDIA Smooth Motion needs an RTX 40 or 50 card. On an RTX 20 or 30 card, copy [RTX Encore](https://github.com/SilyNoMeta/rtx-encore)'s `rtx-encore.dll` next to `CapView.exe` as `dxgi.dll`.
 - AMD Fluid Motion Frames needs a Radeon RX 6000 or newer, or Radeon 700M or 800M graphics, with the monitor plugged into it. It only adds frames in fullscreen.
-- Lossless Scaling needs the Steam app. Press L to start it.
+- Lossless Scaling needs the Steam app. Pick it in settings or press L, and CapView starts Lossless Scaling, goes fullscreen and turns scaling on with no clicks in Lossless Scaling. The fps overlay shows the frame rate Lossless Scaling puts on screen.
+- Intel XeSS frame generation runs on Intel Arc and on other GPUs with shader model 6.4. Copy `libxess_fg.dll` and `libxell.dll` from Intel's [XeSS SDK](https://github.com/intel/xess) next to `CapView.exe`. It doubles the frame rate and outputs SDR only.
 
 ## Notifications
 
